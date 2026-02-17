@@ -4,7 +4,7 @@ publish_to: 'none'
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.9.2
+  sdk: ^3.11.0
 
 dependencies:
   flutter:
@@ -22,8 +22,11 @@ dependencies:
   # State management
   provider: ^6.1.5
 
-  # Image processing
+  # Image processing (Dart-level)
   image: ^4.5.3
+
+  # OpenCV for iris processing
+  opencv_dart: ^2.2.1
 
   # UUID generation for records
   uuid: ^4.5.1
@@ -35,6 +38,12 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+
+# Only include the OpenCV modules we need (reduces binary size)
+hooks:
+  user_defines:
+    dartcv4:
+      include_modules: [core, imgproc, imgcodecs]
 
 flutter:
   uses-material-design: true

@@ -19,6 +19,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
   bool _isInitialized = false;
   bool _isProcessing = false;
   String _statusMessage = 'Initializing camera...';
+  IrisSegmentation? _lastSegmentation;
 
   final DatabaseService _dbService = DatabaseService();
   late final IrisService _irisService;
@@ -38,7 +39,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
         return;
       }
 
-      // Prefer highest resolution back camera
       final camera = _cameras!.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.back,
         orElse: () => _cameras!.first,
@@ -69,6 +69,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
 
     setState(() {
       _isProcessing = true;
+      _lastSegmentation = null;
       _statusMessage = 'Capturing...';
     });
 
@@ -76,23 +77,47 @@ class _ScannerScreenState extends State<ScannerScreen> {
       final xFile = await _cameraController!.takePicture();
       final imageFile = File(xFile.path);
 
-      setState(() => _statusMessage = 'Processing iris...');
-
-      // Save the image
+      setState(() => _statusMessage = 'Saving image...');
       final savedPath = await _irisService.saveEyeImage(imageFile);
 
-      // Generate iris template
-      final template = await _irisService.generateIrisTemplate(savedPath);
+      setState(() => _statusMessage = 'Processing iris (segmentation)...');
+
+      // Run the full OpenCV pipeline
+      final result = await _irisService.processIrisImage(savedPath);
+
+      if (result == null) {
+        if (mounted) {
+          setState(() => _statusMessage = 'Could not detect iris. Try again with better framing.');
+          await _showRetryDialog(
+            'Iris not detected',
+            'The iris boundaries could not be found in the image.\n\n'
+            'Tips:\n'
+            '• Get closer to the eye (fill 60%+ of the frame)\n'
+            '• Ensure good, even lighting\n'
+            '• Keep the eye fully open\n'
+            '• Avoid reflections on the eye surface',
+          );
+        }
+        return;
+      }
+
+      // Show segmentation result
+      setState(() {
+        _lastSegmentation = result.segmentation;
+        _statusMessage = 'Iris detected! Searching for match...';
+      });
+
+      await Future.delayed(const Duration(milliseconds: 800));
 
       // Try to find a match
-      setState(() => _statusMessage = 'Searching for match...');
-      final match = await _irisService.findMatch(template);
+      final match = await _irisService.findMatch(result.template);
 
       if (!mounted) return;
 
       if (match != null) {
-        // Person found
-        setState(() => _statusMessage = 'Match found!');
+        setState(() => _statusMessage =
+            'Match: ${match.person.fullName} (${(match.confidence * 100).toStringAsFixed(1)}%)');
+
         await Future.delayed(const Duration(milliseconds: 500));
 
         if (mounted) {
@@ -104,13 +129,12 @@ class _ScannerScreenState extends State<ScannerScreen> {
           );
         }
       } else {
-        // No match → offer registration
         final shouldRegister = await showDialog<bool>(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('No match found'),
             content: const Text(
-              'This iris is not registered yet. Would you like to register a new person?',
+              'This iris is not registered. Would you like to register a new person?',
             ),
             actions: [
               TextButton(
@@ -131,7 +155,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
             MaterialPageRoute(
               builder: (context) => RegistrationScreen(
                 irisImagePath: savedPath,
-                irisTemplate: template,
+                irisTemplate: result.template,
               ),
             ),
           );
@@ -144,6 +168,22 @@ class _ScannerScreenState extends State<ScannerScreen> {
         setState(() => _isProcessing = false);
       }
     }
+  }
+
+  Future<void> _showRetryDialog(String title, String message) async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK, try again'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -167,10 +207,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
                     alignment: Alignment.center,
                     children: [
                       CameraPreview(_cameraController!),
-                      // Eye guide overlay
                       CustomPaint(
                         size: Size.infinite,
-                        painter: _EyeGuidePainter(),
+                        painter: _EyeGuidePainter(
+                          segmentation: _lastSegmentation,
+                        ),
                       ),
                       if (_isProcessing)
                         Container(
@@ -225,24 +266,28 @@ class _ScannerScreenState extends State<ScannerScreen> {
   }
 }
 
+/// Custom painter that draws the eye alignment guide.
+/// If segmentation data is available, it also draws the detected circles.
 class _EyeGuidePainter extends CustomPainter {
+  final IrisSegmentation? segmentation;
+
+  _EyeGuidePainter({this.segmentation});
+
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = size.width * 0.2;
 
-    final paint = Paint()
+    // Guide circles (always shown)
+    final guidePaint = Paint()
       ..color = Colors.white.withValues(alpha: 0.6)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.0;
 
-    // Outer circle (iris boundary guide)
-    canvas.drawCircle(center, radius, paint);
+    canvas.drawCircle(center, radius, guidePaint);
+    canvas.drawCircle(center, radius * 0.4, guidePaint);
 
-    // Inner circle (pupil guide)
-    canvas.drawCircle(center, radius * 0.4, paint);
-
-    // Crosshair lines
+    // Crosshair
     final crossPaint = Paint()
       ..color = Colors.white.withValues(alpha: 0.3)
       ..strokeWidth = 1.0;
@@ -257,8 +302,39 @@ class _EyeGuidePainter extends CustomPainter {
       Offset(center.dx, center.dy + radius * 1.3),
       crossPaint,
     );
+
+    // If we have segmentation results, draw detected circles in green
+    if (segmentation != null) {
+      final seg = segmentation!;
+
+      final detectedPaint = Paint()
+        ..color = Colors.greenAccent
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.0;
+
+      // Pupil
+      canvas.drawCircle(
+        Offset(seg.pupilCenter.x.toDouble(), seg.pupilCenter.y.toDouble()),
+        seg.pupilRadius.toDouble(),
+        detectedPaint,
+      );
+
+      // Iris
+      final irisPaint = Paint()
+        ..color = Colors.cyanAccent
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
+
+      canvas.drawCircle(
+        Offset(seg.irisCenter.x.toDouble(), seg.irisCenter.y.toDouble()),
+        seg.irisRadius.toDouble(),
+        irisPaint,
+      );
+    }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _EyeGuidePainter oldDelegate) {
+    return oldDelegate.segmentation != segmentation;
+  }
 }
