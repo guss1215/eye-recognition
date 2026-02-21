@@ -37,36 +37,53 @@ class IrisService {
     return savedPath;
   }
 
-  // ─── 2. SEGMENTATION ───────────────────────────────────────────────
+  // ─── 2. PREPROCESSING ──────────────────────────────────────────────
+
+  /// Resizes image to a standard width and applies CLAHE for consistent
+  /// illumination across different captures.
+  ///
+  /// Returns the preprocessed grayscale image and the scale factor used.
+  ({cv.Mat gray, double scale}) _preprocessImage(cv.Mat image) {
+    // Resize to standard width so Hough circle radius parameters work
+    // consistently regardless of camera resolution
+    const standardWidth = 640;
+    final scale = standardWidth / image.cols;
+    final newHeight = (image.rows * scale).round();
+    final resized = cv.resize(image, (standardWidth, newHeight));
+
+    final gray = cv.cvtColor(resized, cv.COLOR_BGR2GRAY);
+    resized.dispose();
+
+    // CLAHE normalizes lighting so captures under different conditions
+    // produce more consistent segmentation results
+    final clahe = cv.CLAHE.create(2.0, (8, 8));
+    final enhanced = clahe.apply(gray);
+    gray.dispose();
+    clahe.dispose();
+
+    return (gray: enhanced, scale: scale);
+  }
+
+  // ─── 3. SEGMENTATION ───────────────────────────────────────────────
 
   /// Detects the pupil (inner circle) and iris (outer circle) boundaries.
   ///
+  /// Expects a preprocessed grayscale image (already resized and CLAHE-enhanced).
   /// Returns null if detection fails (image quality too low, eye not found).
-  ///
-  /// How it works:
-  /// - We convert to grayscale and blur to reduce noise
-  /// - HoughCircles finds circular shapes in the image
-  /// - The smallest detected circle is likely the pupil
-  /// - The largest detected circle is likely the iris boundary
-  IrisSegmentation? segmentIris(cv.Mat image) {
-    // Convert to grayscale
-    final gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY);
-
+  IrisSegmentation? segmentIris(cv.Mat grayImage) {
     // Apply median blur to reduce noise while preserving edges
-    // The kernel size (7) is chosen because iris images have fine texture
-    final blurred = cv.medianBlur(gray, 7);
+    final blurred = cv.medianBlur(grayImage, 7);
 
     // --- Detect pupil (smaller, darker circle) ---
-    // We use stricter parameters for the pupil since it's well-defined
     final pupilCircles = cv.HoughCircles(
       blurred,
       cv.HOUGH_GRADIENT,
-      1.5, // dp: accumulator resolution ratio (1.5 = slightly coarser than input)
-      50, // minDist: minimum distance between circle centers
-      param1: 100, // upper Canny threshold
-      param2: 40, // accumulator threshold (higher = fewer but more confident detections)
-      minRadius: 10, // minimum pupil radius in pixels
-      maxRadius: 80, // maximum pupil radius in pixels
+      1.5,
+      50,
+      param1: 100,
+      param2: 40,
+      minRadius: 10,
+      maxRadius: 80,
     );
 
     // --- Detect iris boundary (larger circle) ---
@@ -74,48 +91,72 @@ class IrisService {
       blurred,
       cv.HOUGH_GRADIENT,
       1.5,
-      100, // larger minDist since the iris is bigger
+      100,
       param1: 80,
       param2: 35,
-      minRadius: 60, // iris is always larger than pupil
+      minRadius: 60,
       maxRadius: 200,
     );
 
-    gray.dispose();
     blurred.dispose();
 
-    // Need at least one of each to proceed
     if (pupilCircles.rows == 0 || irisCircles.rows == 0) {
       pupilCircles.dispose();
       irisCircles.dispose();
       return null;
     }
 
-    // Take the first detected circle for each
-    // pupilCircles is a Mat of shape (1, N, 3) where each circle is (x, y, radius)
-    final pupilX = pupilCircles.at<double>(0, 0).toInt();
-    final pupilY = pupilCircles.at<double>(0, 1).toInt();
-    final pupilR = pupilCircles.at<double>(0, 2).toInt();
+    // Select the best circle from candidates instead of taking the first one.
+    // Prefer circles closest to the image center (the user aligns the eye there).
+    final centerX = grayImage.cols / 2.0;
+    final centerY = grayImage.rows / 2.0;
 
-    final irisX = irisCircles.at<double>(0, 0).toInt();
-    final irisY = irisCircles.at<double>(0, 1).toInt();
-    final irisR = irisCircles.at<double>(0, 2).toInt();
+    final pupil = _selectBestCircle(pupilCircles, centerX, centerY);
+    final iris = _selectBestCircle(irisCircles, centerX, centerY);
 
     pupilCircles.dispose();
     irisCircles.dispose();
 
     // Basic sanity check: iris must be larger than pupil
-    if (irisR <= pupilR) return null;
+    if (iris.radius <= pupil.radius) return null;
+
+    print('[IrisService] Segmentation: pupil=(${pupil.x},${pupil.y},r=${pupil.radius}) '
+        'iris=(${iris.x},${iris.y},r=${iris.radius})');
 
     return IrisSegmentation(
-      pupilCenter: Point(pupilX, pupilY),
-      pupilRadius: pupilR,
-      irisCenter: Point(irisX, irisY),
-      irisRadius: irisR,
+      pupilCenter: Point(pupil.x, pupil.y),
+      pupilRadius: pupil.radius,
+      irisCenter: Point(iris.x, iris.y),
+      irisRadius: iris.radius,
     );
   }
 
-  // ─── 3. NORMALIZATION (DAUGMAN'S RUBBER SHEET MODEL) ────────────────
+  /// Picks the circle closest to the given center from HoughCircles results.
+  ({int x, int y, int radius}) _selectBestCircle(
+    cv.Mat circles, double centerX, double centerY,
+  ) {
+    int bestIdx = 0;
+    double bestDist = double.infinity;
+
+    final numCircles = circles.cols;
+    for (int i = 0; i < numCircles; i++) {
+      final cx = circles.at<double>(0, i * 3);
+      final cy = circles.at<double>(0, i * 3 + 1);
+      final dist = (cx - centerX) * (cx - centerX) + (cy - centerY) * (cy - centerY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+
+    return (
+      x: circles.at<double>(0, bestIdx * 3).toInt(),
+      y: circles.at<double>(0, bestIdx * 3 + 1).toInt(),
+      radius: circles.at<double>(0, bestIdx * 3 + 2).toInt(),
+    );
+  }
+
+  // ─── 4. NORMALIZATION (DAUGMAN'S RUBBER SHEET MODEL) ────────────────
 
   /// Unwraps the donut-shaped iris region into a fixed-size rectangular strip.
   ///
@@ -167,7 +208,7 @@ class IrisService {
     return normalized;
   }
 
-  // ─── 4. FEATURE ENCODING ────────────────────────────────────────────
+  // ─── 5. FEATURE ENCODING ────────────────────────────────────────────
 
   /// Encodes the normalized iris image into a feature vector.
   ///
@@ -231,33 +272,38 @@ class IrisService {
     return features;
   }
 
-  // ─── 5. FULL PIPELINE ──────────────────────────────────────────────
+  // ─── 6. FULL PIPELINE ──────────────────────────────────────────────
 
-  /// Runs the complete pipeline: load → segment → normalize → encode.
+  /// Runs the complete pipeline: load → preprocess → segment → normalize → encode.
   ///
   /// Returns null if segmentation fails (eye not found in image).
   Future<IrisProcessingResult?> processIrisImage(String imagePath) async {
     final image = cv.imread(imagePath, flags: cv.IMREAD_COLOR);
     if (image.isEmpty) return null;
 
-    final gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY);
+    // Step 1: Preprocess (resize + CLAHE for consistent results)
+    final (:gray, :scale) = _preprocessImage(image);
+    image.dispose();
 
-    // Step 1: Segment iris
-    final segmentation = segmentIris(image);
+    print('[IrisService] Preprocessed: ${gray.cols}x${gray.rows} (scale=$scale)');
+
+    // Step 2: Segment iris
+    final segmentation = segmentIris(gray);
     if (segmentation == null) {
-      image.dispose();
       gray.dispose();
+      print('[IrisService] Segmentation failed - iris not found');
       return null;
     }
 
-    // Step 2: Normalize
+    // Step 3: Normalize
     final normalized = normalizeIris(gray, segmentation);
 
-    // Step 3: Encode
+    // Step 4: Encode
     final template = encodeIris(normalized);
 
+    print('[IrisService] Template generated: ${template.length} features');
+
     // Clean up
-    image.dispose();
     gray.dispose();
     normalized.dispose();
 
@@ -273,7 +319,7 @@ class IrisService {
     return result?.template;
   }
 
-  // ─── 6. MATCHING ───────────────────────────────────────────────────
+  // ─── 7. MATCHING ───────────────────────────────────────────────────
 
   /// Compares two iris templates using normalized Euclidean distance.
   ///
@@ -295,17 +341,18 @@ class IrisService {
     final distance = sqrt(sumSquaredDiff / template1.length);
 
     // Convert distance to similarity (0 distance = 1.0 similarity)
-    // Using exponential decay so small differences still give high scores
-    return exp(-distance * 5.0);
+    // Using exponential decay; multiplier of 3.0 allows more tolerance
+    // for real-world capture variations from mobile cameras
+    return exp(-distance * 3.0);
   }
 
   /// Searches all registered persons for the best iris match.
   ///
   /// Returns the best match above [threshold], or null if no match.
-  /// Default threshold of 0.75 balances false accepts vs false rejects.
+  /// Threshold of 0.55 accounts for real-world capture variations.
   Future<IrisMatchResult?> findMatch(
     List<double> template, {
-    double threshold = 0.75,
+    double threshold = 0.55,
   }) async {
     final persons = await _dbService.getPersonsWithIrisTemplate();
 
@@ -316,11 +363,15 @@ class IrisService {
       if (person.irisTemplate == null) continue;
 
       final score = compareTemplates(template, person.irisTemplate!);
+      print('[IrisService] Match vs ${person.fullName}: ${(score * 100).toStringAsFixed(1)}%');
       if (score > bestScore) {
         bestScore = score;
         bestMatch = person;
       }
     }
+
+    print('[IrisService] Best score: ${(bestScore * 100).toStringAsFixed(1)}% '
+        '(threshold: ${(threshold * 100).toStringAsFixed(0)}%)');
 
     if (bestMatch != null && bestScore >= threshold) {
       return IrisMatchResult(person: bestMatch, confidence: bestScore);
