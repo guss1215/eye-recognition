@@ -46,7 +46,7 @@ class PersonDetailScreen extends StatelessWidget {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
-                color: person.irisTemplate != null
+                color: person.irisTemplates != null && person.irisTemplates!.isNotEmpty
                     ? Colors.green.shade50
                     : Colors.orange.shade50,
                 borderRadius: BorderRadius.circular(8),
@@ -55,21 +55,21 @@ class PersonDetailScreen extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Icon(
-                    person.irisTemplate != null
+                    person.irisTemplates != null && person.irisTemplates!.isNotEmpty
                         ? Icons.verified
                         : Icons.warning_amber,
                     size: 18,
-                    color: person.irisTemplate != null
+                    color: person.irisTemplates != null && person.irisTemplates!.isNotEmpty
                         ? Colors.green.shade700
                         : Colors.orange.shade700,
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    person.irisTemplate != null
-                        ? 'Iris registered'
+                    person.irisTemplates != null && person.irisTemplates!.isNotEmpty
+                        ? 'Iris registered (${person.irisTemplates!.length} template${person.irisTemplates!.length > 1 ? 's' : ''})'
                         : 'No iris data',
                     style: TextStyle(
-                      color: person.irisTemplate != null
+                      color: person.irisTemplates != null && person.irisTemplates!.isNotEmpty
                           ? Colors.green.shade700
                           : Colors.orange.shade700,
                       fontWeight: FontWeight.w500,

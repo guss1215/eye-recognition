@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'screens/scanner_screen.dart';
 import 'screens/persons_list_screen.dart';
 import 'screens/registration_screen.dart';
+import 'services/iris_service.dart' show ScanMode;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -92,7 +93,7 @@ class _DashboardScreen extends StatelessWidget {
         title: const Text('Eye Recognition'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -128,6 +129,22 @@ class _DashboardScreen extends StatelessWidget {
                   context,
                   MaterialPageRoute(
                     builder: (context) => const ScannerScreen(),
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+
+            _ActionCard(
+              icon: Icons.how_to_reg,
+              title: 'Enroll Iris',
+              description: 'Register a new person with 3 high-quality iris scans',
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) =>
+                        const ScannerScreen(mode: ScanMode.enrollment),
                   ),
                 );
               },

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import '../models/person.dart';
@@ -17,8 +18,9 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
     );
   }
 
@@ -33,11 +35,37 @@ class DatabaseService {
         phone TEXT,
         notes TEXT,
         iris_image_path TEXT,
-        iris_template TEXT,
+        iris_templates TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )
     ''');
+  }
+
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      // Add the new multi-template column
+      await db.execute('ALTER TABLE persons ADD COLUMN iris_templates TEXT');
+
+      // Migrate existing single templates to JSON array format
+      final rows = await db.query(
+        'persons',
+        columns: ['id', 'iris_template'],
+        where: 'iris_template IS NOT NULL',
+      );
+      for (final row in rows) {
+        final oldTemplate = row['iris_template'] as String;
+        final templateList =
+            oldTemplate.split(',').map((e) => double.parse(e)).toList();
+        final jsonTemplates = jsonEncode([templateList]);
+        await db.update(
+          'persons',
+          {'iris_templates': jsonTemplates},
+          where: 'id = ?',
+          whereArgs: [row['id']],
+        );
+      }
+    }
   }
 
   Future<String> insertPerson(Person person) async {
@@ -84,12 +112,12 @@ class DatabaseService {
     return maps.map((map) => Person.fromMap(map)).toList();
   }
 
-  /// Returns all persons that have an iris template stored.
+  /// Returns all persons that have iris templates stored.
   Future<List<Person>> getPersonsWithIrisTemplate() async {
     final db = await database;
     final maps = await db.query(
       'persons',
-      where: 'iris_template IS NOT NULL',
+      where: 'iris_templates IS NOT NULL',
     );
     return maps.map((map) => Person.fromMap(map)).toList();
   }

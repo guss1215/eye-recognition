@@ -6,12 +6,12 @@ import '../services/database_service.dart';
 
 class RegistrationScreen extends StatefulWidget {
   final String? irisImagePath;
-  final List<double>? irisTemplate;
+  final List<List<double>>? irisTemplates;
 
   const RegistrationScreen({
     super.key,
     this.irisImagePath,
-    this.irisTemplate,
+    this.irisTemplates,
   });
 
   @override
@@ -52,7 +52,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             ? null
             : _notesController.text.trim(),
         irisImagePath: widget.irisImagePath,
-        irisTemplate: widget.irisTemplate,
+        irisTemplates: widget.irisTemplates,
         createdAt: now,
         updatedAt: now,
       );
@@ -121,7 +121,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                   ),
                 ),
 
-              if (widget.irisTemplate != null)
+              if (widget.irisTemplates != null && widget.irisTemplates!.isNotEmpty)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 16),
                   child: Row(
@@ -130,7 +130,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                           color: Colors.green.shade700, size: 20),
                       const SizedBox(width: 8),
                       Text(
-                        'Iris template captured',
+                        '${widget.irisTemplates!.length} iris template(s) captured',
                         style: TextStyle(color: Colors.green.shade700),
                       ),
                     ],
