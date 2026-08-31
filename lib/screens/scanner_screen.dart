@@ -122,11 +122,28 @@ class _ScannerScreenState extends State<ScannerScreen> {
       _readySince = null;
       _statusMessage = 'Scanning... align the eye';
     });
+    // Point continuous autofocus/metering at the center (the eye guide) so the
+    // iris — not the background — drives focus and exposure.
+    _focusOnEye();
     // Start stream if not already running
     if (_cameraController != null &&
         !_cameraController!.value.isStreamingImages) {
       _startLiveDetection();
     }
+  }
+
+  Future<void> _focusOnEye() async {
+    final c = _cameraController;
+    if (c == null) return;
+    const center = Offset(0.5, 0.5);
+    try {
+      await c.setFocusMode(FocusMode.auto);
+      await c.setFocusPoint(center);
+    } catch (_) {}
+    try {
+      await c.setExposureMode(ExposureMode.auto);
+      await c.setExposurePoint(center);
+    } catch (_) {}
   }
 
   void _handleLiveDetectionFrame(CameraImage image) {
@@ -181,9 +198,9 @@ class _ScannerScreenState extends State<ScannerScreen> {
     _isAnalyzingFrame = true;
 
     try {
-      final grayMat = _cameraImageToGrayscale(image);
-      final scored = _irisService.scoreFrame(grayMat);
-      grayMat.dispose();
+      final mat = _cameraImageToProcessed(image);
+      final scored = _irisService.scoreFrame(mat);
+      mat.dispose();
 
       if (scored != null) {
         _burstFrames.add(scored);
@@ -204,6 +221,8 @@ class _ScannerScreenState extends State<ScannerScreen> {
     }
   }
 
+  /// Fast luma (Y-plane) grayscale — used for live detection where speed matters
+  /// and only segmentation (not encoding) happens.
   cv.Mat _cameraImageToGrayscale(CameraImage image) {
     final yPlane = image.planes[0];
     final width = image.width;
@@ -220,6 +239,71 @@ class _ScannerScreenState extends State<ScannerScreen> {
       bytes.setRange(dstOffset, dstOffset + width, yPlane.bytes, srcOffset);
     }
     return cv.Mat.fromList(height, width, cv.MatType.CV_8UC1, bytes);
+  }
+
+  /// Single-channel Mat used for the encode path. Prefers the RED channel
+  /// (closest to near-infrared, best texture for brown eyes in visible light);
+  /// falls back to luma on iOS bi-planar formats or any conversion error.
+  ///
+  /// IMPORTANT: enrollment and verification must use the SAME channel, so keep
+  /// this consistent across the deployment (ideally one device/platform).
+  cv.Mat _cameraImageToProcessed(CameraImage image) {
+    if (IrisService.useRedChannel && image.planes.length >= 3) {
+      try {
+        final nv21 = _yuv420ToNv21(image);
+        final yuvMat = cv.Mat.fromList(
+          image.height + image.height ~/ 2,
+          image.width,
+          cv.MatType.CV_8UC1,
+          nv21,
+        );
+        final rgb = cv.cvtColor(yuvMat, cv.COLOR_YUV2RGB_NV21);
+        yuvMat.dispose();
+        final red = cv.extractChannel(rgb, 0); // RGB → channel 0 is red
+        rgb.dispose();
+        return red;
+      } catch (e) {
+        print('[Scanner] Red-channel conversion failed, using luma: $e');
+      }
+    }
+    return _cameraImageToGrayscale(image);
+  }
+
+  /// Repacks Android YUV_420_888 planes into a contiguous NV21 buffer
+  /// (Y plane followed by interleaved V,U), handling row/pixel strides.
+  Uint8List _yuv420ToNv21(CameraImage image) {
+    final width = image.width;
+    final height = image.height;
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+
+    final nv21 = Uint8List(width * height + (width * height) ~/ 2);
+
+    int idx = 0;
+    for (int row = 0; row < height; row++) {
+      final srcOffset = row * yPlane.bytesPerRow;
+      nv21.setRange(idx, idx + width, yPlane.bytes, srcOffset);
+      idx += width;
+    }
+
+    final uvRowStride = uPlane.bytesPerRow;
+    final uvPixelStride = uPlane.bytesPerPixel ?? 1;
+    final uBytes = uPlane.bytes;
+    final vBytes = vPlane.bytes;
+    final chromaHeight = height ~/ 2;
+    final chromaWidth = width ~/ 2;
+
+    for (int row = 0; row < chromaHeight; row++) {
+      final rowStart = row * uvRowStride;
+      for (int col = 0; col < chromaWidth; col++) {
+        final uvOffset = rowStart + col * uvPixelStride;
+        nv21[idx++] = vBytes[uvOffset]; // V
+        nv21[idx++] = uBytes[uvOffset]; // U
+      }
+    }
+
+    return nv21;
   }
 
   String _messageForStatus(IrisDetectionStatus status) {
@@ -244,28 +328,16 @@ class _ScannerScreenState extends State<ScannerScreen> {
       _currentQualityScore = 0.0;
       _statusMessage = 'Hold steady... capturing';
     });
-
-    // Lock AE/AF for consistent frames
-    try {
-      _cameraController?.setExposureMode(ExposureMode.locked);
-    } catch (_) {}
-    try {
-      _cameraController?.setFocusMode(FocusMode.locked);
-    } catch (_) {}
+    // Continuous AF/AE is kept ON during the short burst: it tracks the eye and
+    // avoids locking a mid-hunt (blurry) focus. selectBestFrames already keeps
+    // only the sharpest frames, so per-frame exposure variation is tolerable.
   }
 
   Future<void> _finishBurstCapture() async {
     _phase = _ScannerPhase.processing;
 
-    // Stop stream and unlock AE/AF
     try {
       await _cameraController?.stopImageStream();
-    } catch (_) {}
-    try {
-      _cameraController?.setExposureMode(ExposureMode.auto);
-    } catch (_) {}
-    try {
-      _cameraController?.setFocusMode(FocusMode.auto);
     } catch (_) {}
 
     if (!mounted) return;
@@ -389,9 +461,9 @@ class _ScannerScreenState extends State<ScannerScreen> {
 
     setState(() => _statusMessage = 'Searching for match...');
 
-    // Use the best template for matching
-    final template = burstResult.templates.first;
-    final candidates = await _irisService.findCandidates(template);
+    // Fuse across all probe templates (min-rule) for robustness.
+    final candidates =
+        await _irisService.findCandidatesMulti(burstResult.templates);
 
     if (!mounted) return;
 
@@ -755,7 +827,9 @@ class _EyeGuidePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    final guideRadius = size.width * 0.22;
+    // Larger guide encourages the user to bring the eye closer so the iris fills
+    // more of the frame (more pixels across the iris → more usable texture).
+    final guideRadius = size.width * 0.30;
 
     final color = switch (phase) {
       _ScannerPhase.idle => Colors.white.withValues(alpha: 0.5),
